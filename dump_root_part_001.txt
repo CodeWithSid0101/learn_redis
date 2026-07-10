@@ -3,15 +3,20 @@
 📄 FILE: database.py
 ──────────────────────────────────────────────────────────────────────
 import os
+from urllib.parse import quote_plus
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from fastapi import HTTPException, status
 
-# Password is read from an environment variable — never hardcode it, since
-# this file may get dumped/pushed elsewhere. Set it before running:
+# Password is read from an environment variable and URL-encoded so special
+# characters (like '@' in "Sidd@200428") don't break the connection string
+# parsing — without encoding, SQLAlchemy misreads the second '@' as the
+# separator before the host, producing a garbage hostname.
 #   Windows (CMD): set MYSQL_ROOT_PASSWORD=Sidd@200428
-DB_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "")
+DB_PASSWORD_RAW = os.environ.get("MYSQL_ROOT_PASSWORD", "")
+DB_PASSWORD = quote_plus(DB_PASSWORD_RAW)
+
 SQL_URL = f"mysql+pymysql://root:{DB_PASSWORD}@127.0.0.1:3306/local_operations"
 
 engine = create_engine(SQL_URL, pool_pre_ping=True)

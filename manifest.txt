@@ -1,0 +1,28 @@
+======================================================================
+PROJECT MANIFEST
+======================================================================
+
+Project   : C:\Sid\git\learn_redis
+Generated : 2026-07-10 16:32:09
+Incremental run: False
+Excel extraction: enabled
+
+--- DIRECTORY TREE ---
+
+📁 learn_redis/
+    📄 database.py
+    📄 main.py
+    📄 models.py
+    📄 redis_client.py
+    📄 redis_learning_data.xlsx [EXCEL]
+    📄 requirements.txt
+    📄 schemas.py
+    📄 seed_data.py
+
+--- SKIPPED ENTRIES ---
+
+  📁 [DIR SKIPPED]  venv/   → virtual environment
+  📁 [DIR SKIPPED]  __pycache__/   → Python cache
+
+--- PARTS (filled in below) ---
+  dump_root_part_001.txt  (38.4 KB) — group 'root'

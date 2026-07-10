@@ -1,0 +1,549 @@
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: database.py
+──────────────────────────────────────────────────────────────────────
+import os
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import sessionmaker, declarative_base
+from fastapi import HTTPException, status
+
+# Password is read from an environment variable — never hardcode it, since
+# this file may get dumped/pushed elsewhere. Set it before running:
+#   Windows (CMD): set MYSQL_ROOT_PASSWORD=Sidd@200428
+DB_PASSWORD = os.environ.get("MYSQL_ROOT_PASSWORD", "")
+SQL_URL = f"mysql+pymysql://root:{DB_PASSWORD}@127.0.0.1:3306/local_operations"
+
+engine = create_engine(SQL_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+TABLE_NAME = "sample"
+
+
+def get_db():
+    try:
+        inspector = inspect(engine)
+        table_exists = inspector.has_table(TABLE_NAME)
+    except OperationalError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Could not connect to the database: {e}",
+        )
+
+    if not table_exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No table found named '{TABLE_NAME}'. Please create it before using this API.",
+        )
+
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: main.py
+──────────────────────────────────────────────────────────────────────
+import io
+import time
+from fastapi import FastAPI, HTTPException, status, Depends, UploadFile, File
+from sqlalchemy.orm import Session
+
+import models
+from database import get_db
+from schemas import OrderCreate, OrderFetchRequest, OrderResponse
+from redis_client import (
+    get_cache, set_cache, delete_cache,
+    cache_key_for_order, cache_key_for_list, invalidate_list_cache,
+)
+from seed_data import seed_from_excel, validate_excel_headers
+
+app = FastAPI(title="Orders API with Redis Caching")
+
+
+@app.get("/orders/status", status_code=status.HTTP_200_OK)
+def orders_status(db: Session = Depends(get_db)):
+    count = db.query(models.Order).count()
+    return {"total_orders_in_db": count, "seeded": count > 0}
+
+
+@app.post("/orders/upload-excel", status_code=status.HTTP_200_OK)
+async def upload_orders_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    filename = (file.filename or "").lower()
+    if not filename.endswith((".xlsx", ".xlsm", ".xls")):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .xlsx, .xlsm, or .xls files are supported.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    file_stream = io.BytesIO(contents)
+    is_valid, message = validate_excel_headers(file_stream)
+    if not is_valid:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Excel validation failed: {message}")
+
+    file_stream.seek(0)
+    summary = seed_from_excel(db, excel_path=file_stream)
+    invalidate_list_cache()
+    return {"detail": "Excel validated and orders uploaded successfully.", **summary}
+
+
+@app.post("/orders/seed", status_code=status.HTTP_200_OK)
+def seed_orders_from_excel(db: Session = Depends(get_db)):
+    summary = seed_from_excel(db)
+    invalidate_list_cache()
+    return {"detail": "Seed complete", **summary}
+
+
+@app.post("/orders/create", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
+    start = time.perf_counter()
+
+    existing = db.query(models.Order).filter(models.Order.order_id == payload.order_id).first()
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="order_id already exists")
+
+    order = models.Order(**payload.model_dump())
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+
+    response_data = OrderResponse.model_validate(order).model_dump()
+    response_data["cache_hit"] = False
+    response_data["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+    set_cache(cache_key_for_order(order.order_id), response_data)
+    invalidate_list_cache()
+
+    return response_data
+
+
+@app.post("/orders/fetch")
+def fetch_orders(payload: OrderFetchRequest, db: Session = Depends(get_db)):
+    start = time.perf_counter()
+
+    if payload.order_id:
+        key = cache_key_for_order(payload.order_id)
+        cached = get_cache(key)
+        if cached is not None:
+            cached["cache_hit"] = True
+            cached["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+            return cached
+
+        order = db.query(models.Order).filter(models.Order.order_id == payload.order_id).first()
+        if not order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+        response_data = OrderResponse.model_validate(order).model_dump()
+        response_data["cache_hit"] = False
+        response_data["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+        set_cache(key, response_data)
+        return response_data
+
+    key = cache_key_for_list()
+    cached = get_cache(key)
+    if cached is not None:
+        for row in cached:
+            row["cache_hit"] = True
+            row["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+        return cached
+
+    orders = db.query(models.Order).all()
+    response_data = [OrderResponse.model_validate(o).model_dump() for o in orders]
+    for row in response_data:
+        row["cache_hit"] = False
+        row["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+    set_cache(key, response_data)
+    return response_data
+
+
+@app.post("/orders/update", response_model=OrderResponse)
+def update_order(order_id: str, payload: OrderCreate, db: Session = Depends(get_db)):
+    start = time.perf_counter()
+    order = db.query(models.Order).filter(models.Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    for field, value in payload.model_dump().items():
+        setattr(order, field, value)
+    db.commit()
+    db.refresh(order)
+
+    response_data = OrderResponse.model_validate(order).model_dump()
+    response_data["cache_hit"] = False
+    response_data["response_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+    set_cache(cache_key_for_order(order_id), response_data)
+    invalidate_list_cache()
+    return response_data
+
+
+@app.post("/orders/delete", status_code=status.HTTP_200_OK)
+def delete_order(order_id: str, db: Session = Depends(get_db)):
+    order = db.query(models.Order).filter(models.Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    db.delete(order)
+    db.commit()
+
+    delete_cache(cache_key_for_order(order_id))
+    invalidate_list_cache()
+    return {"detail": f"Order {order_id} deleted"}
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: models.py
+──────────────────────────────────────────────────────────────────────
+from sqlalchemy import Column, Integer, String, Float
+from database import Base
+
+
+class Order(Base):
+    __tablename__ = "sample"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    order_id = Column(String(64), unique=True, index=True, nullable=False)
+    customer_id = Column(String(64), index=True, nullable=False)
+    customer_name = Column(String(128), nullable=False)
+    customer_email = Column(String(128), nullable=False)
+    product_id = Column(String(64), index=True, nullable=False)
+    product_name = Column(String(128), nullable=False)
+    category = Column(String(64))
+    sub_category = Column(String(64))
+    brand = Column(String(64))
+    unit_price = Column(Float)
+    quantity = Column(Integer)
+    discount_percent = Column(Float)
+    total_price = Column(Float)
+    order_date = Column(String(32))
+    delivery_date = Column(String(32))
+    order_status = Column(String(32))
+    payment_method = Column(String(32))
+    payment_status = Column(String(32))
+    shipping_address = Column(String(256))
+    city = Column(String(64))
+    state = Column(String(64))
+    country = Column(String(64))
+    warehouse_id = Column(String(64))
+
+    def __repr__(self):
+        return f"<Order order_id={self.order_id}>"
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: redis_client.py
+──────────────────────────────────────────────────────────────────────
+import json
+import logging
+import redis
+
+logger = logging.getLogger("redis_client")
+
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+REDIS_DB = 0
+CACHE_TTL_SECONDS = 300
+
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    decode_responses=True,
+    socket_connect_timeout=2,
+    socket_timeout=2,
+)
+
+
+def cache_key_for_order(order_id: str) -> str:
+    return f"order:{order_id}"
+
+
+def cache_key_for_list() -> str:
+    return "orders:all"
+
+
+def get_cache(key: str):
+    try:
+        val = redis_client.get(key)
+        return json.loads(val) if val is not None else None
+    except redis.exceptions.RedisError as e:
+        logger.warning(f"Redis unavailable during get_cache('{key}'): {e}")
+        return None
+
+
+def set_cache(key: str, value, ttl: int = CACHE_TTL_SECONDS):
+    try:
+        redis_client.set(key, json.dumps(value, default=str), ex=ttl)
+    except redis.exceptions.RedisError as e:
+        logger.warning(f"Redis unavailable during set_cache('{key}'): {e}")
+
+
+def delete_cache(key: str):
+    try:
+        redis_client.delete(key)
+    except redis.exceptions.RedisError as e:
+        logger.warning(f"Redis unavailable during delete_cache('{key}'): {e}")
+
+
+def invalidate_list_cache():
+    try:
+        redis_client.delete(cache_key_for_list())
+    except redis.exceptions.RedisError as e:
+        logger.warning(f"Redis unavailable during invalidate_list_cache(): {e}")
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: redis_learning_data.xlsx
+──────────────────────────────────────────────────────────────────────
+--- Sheet: Order_Data (rows=36, cols=25) ---
+[Column widths] A=10.0, B=13.0, C=15.0, D=29.0, E=12.0, F=22.0, G=16.0, H=17.0, I=12.0, J=12.0, K=10.0, L=18.0, M=18.0, N=18.0, O=15.0, P=14.0, Q=16.0, R=16.0, S=24.0, T=11.0, U=13.0, V=9.0, W=14.0, X=11.0, Y=18.0
+order_id [bg=#004F81BD,color=#00FFFFFF,bold] | customer_id [bg=#004F81BD,color=#00FFFFFF,bold] | customer_name [bg=#004F81BD,color=#00FFFFFF,bold] | customer_email [bg=#004F81BD,color=#00FFFFFF,bold] | product_id [bg=#004F81BD,color=#00FFFFFF,bold] | product_name [bg=#004F81BD,color=#00FFFFFF,bold] | category [bg=#004F81BD,color=#00FFFFFF,bold] | sub_category [bg=#004F81BD,color=#00FFFFFF,bold] | brand [bg=#004F81BD,color=#00FFFFFF,bold] | unit_price [bg=#004F81BD,color=#00FFFFFF,bold] | quantity [bg=#004F81BD,color=#00FFFFFF,bold] | discount_percent [bg=#004F81BD,color=#00FFFFFF,bold] | total_price [bg=#004F81BD,color=#00FFFFFF,bold] | order_date [bg=#004F81BD,color=#00FFFFFF,bold] | delivery_date [bg=#004F81BD,color=#00FFFFFF,bold] | order_status [bg=#004F81BD,color=#00FFFFFF,bold] | payment_method [bg=#004F81BD,color=#00FFFFFF,bold] | payment_status [bg=#004F81BD,color=#00FFFFFF,bold] | shipping_address [bg=#004F81BD,color=#00FFFFFF,bold] | city [bg=#004F81BD,color=#00FFFFFF,bold] | state [bg=#004F81BD,color=#00FFFFFF,bold] | country [bg=#004F81BD,color=#00FFFFFF,bold] | warehouse_id [bg=#004F81BD,color=#00FFFFFF,bold] | cache_hit [bg=#004F81BD,color=#00FFFFFF,bold] | response_time_ms [bg=#004F81BD,color=#00FFFFFF,bold]
+ORD-1001 [bg=#00DDEBF7] | CUST-002 [bg=#00DDEBF7] | Vivaan Singh [bg=#00DDEBF7] | vivaan.singh94@example.com [bg=#00DDEBF7] | PROD-106 [bg=#00DDEBF7] | Non-stick Pan [bg=#00DDEBF7] | Home & Kitchen [bg=#00DDEBF7] | Cookware [bg=#00DDEBF7] | BrandE [bg=#00DDEBF7] | 1200 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.06 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-22 17:00 [bg=#00DDEBF7] | 2023-10-27 [bg=#00DDEBF7] | Delivered [bg=#00DDEBF7] | Wallet [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 267 Main St, Kolkata [bg=#00DDEBF7] | Kolkata [bg=#00DDEBF7] | West Bengal [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-KOL-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 10 [bg=#00DDEBF7]
+ORD-1002 | CUST-006 | Sai Joshi | sai.joshi67@example.com | PROD-106 | Non-stick Pan | Home & Kitchen | Cookware | BrandE | 1200 | 1 | 0.07 | 2023-11-12 03:00 | 2023-11-19 | Delivered | Debit Card | Refunded | 815 Main St, Kolkata | Kolkata | West Bengal | India | WH-KOL-01 | False | 83
+ORD-1003 [bg=#00DDEBF7] | CUST-012 [bg=#00DDEBF7] | Saanvi Shah [bg=#00DDEBF7] | saanvi.shah80@example.com [bg=#00DDEBF7] | PROD-103 [bg=#00DDEBF7] | Smartphone Model X [bg=#00DDEBF7] | Electronics [bg=#00DDEBF7] | Mobiles [bg=#00DDEBF7] | BrandC [bg=#00DDEBF7] | 14999 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.09 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-18 16:00 [bg=#00DDEBF7] | 2023-10-21 [bg=#00DDEBF7] | Processing [bg=#00DDEBF7] | Wallet [bg=#00DDEBF7] | Refunded [bg=#00DDEBF7] | 537 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 11 [bg=#00DDEBF7]
+ORD-1004 | CUST-011 | Diya Mehta | diya.mehta74@example.com | PROD-109 | LEGO Classic Set | Toys | Building Blocks | LEGO | 2999 | 1 | 0.13 | 2023-11-11 01:00 | 2023-11-14 | Cancelled | UPI | Refunded | 72 Main St, Delhi | Delhi | Delhi | India | WH-DEL-02 | True | 8
+ORD-1005 [bg=#00DDEBF7] | CUST-004 [bg=#00DDEBF7] | Vihaan Gupta [bg=#00DDEBF7] | vihaan.gupta39@example.com [bg=#00DDEBF7] | PROD-106 [bg=#00DDEBF7] | Non-stick Pan [bg=#00DDEBF7] | Home & Kitchen [bg=#00DDEBF7] | Cookware [bg=#00DDEBF7] | BrandE [bg=#00DDEBF7] | 1200 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.24 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-11 20:00 [bg=#00DDEBF7] | 2023-11-18 [bg=#00DDEBF7] | Processing [bg=#00DDEBF7] | Net Banking [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 46 Main St, Mumbai [bg=#00DDEBF7] | Mumbai [bg=#00DDEBF7] | Maharashtra [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-MUM-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 7 [bg=#00DDEBF7]
+ORD-1006 | CUST-013 | Aanya Iyer | aanya.iyer21@example.com | PROD-106 | Non-stick Pan | Home & Kitchen | Cookware | BrandE | 1200 | 3 | 0.23 | 2023-10-13 06:00 | 2023-10-15 | Cancelled | UPI | Refunded | 186 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | False | 152
+ORD-1007 [bg=#00DDEBF7] | CUST-005 [bg=#00DDEBF7] | Arjun Patel [bg=#00DDEBF7] | arjun.patel8@example.com [bg=#00DDEBF7] | PROD-104 [bg=#00DDEBF7] | Bluetooth Headphones [bg=#00DDEBF7] | Electronics [bg=#00DDEBF7] | Accessories [bg=#00DDEBF7] | BrandD [bg=#00DDEBF7] | 2499 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.21 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-08 15:00 [bg=#00DDEBF7] | 2023-11-12 [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 972 Main St, Mumbai [bg=#00DDEBF7] | Mumbai [bg=#00DDEBF7] | Maharashtra [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-MUM-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 5 [bg=#00DDEBF7]
+ORD-1008 | CUST-001 | Aarav Sharma | aarav.sharma82@example.com | PROD-109 | LEGO Classic Set | Toys | Building Blocks | LEGO | 2999 | 3 | 0.08 | 2023-10-30 01:00 | 2023-11-05 | Shipped | UPI | Pending | 225 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | True | 6
+ORD-1009 [bg=#00DDEBF7] | CUST-013 [bg=#00DDEBF7] | Aanya Iyer [bg=#00DDEBF7] | aanya.iyer21@example.com [bg=#00DDEBF7] | PROD-109 [bg=#00DDEBF7] | LEGO Classic Set [bg=#00DDEBF7] | Toys [bg=#00DDEBF7] | Building Blocks [bg=#00DDEBF7] | LEGO [bg=#00DDEBF7] | 2999 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.1 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-17 17:00 [bg=#00DDEBF7] | 2023-11-20 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | Wallet [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 985 Main St, Hyderabad [bg=#00DDEBF7] | Hyderabad [bg=#00DDEBF7] | Telangana [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-HYD-02 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 10 [bg=#00DDEBF7]
+ORD-1010 | CUST-011 | Diya Mehta | diya.mehta74@example.com | PROD-104 | Bluetooth Headphones | Electronics | Accessories | BrandD | 2499 | 3 | 0.11 | 2023-10-20 13:00 | 2023-10-24 | Pending | Wallet | Failed | 328 Main St, Kolkata | Kolkata | West Bengal | India | WH-KOL-01 | True | 5
+ORD-1011 [bg=#00DDEBF7] | CUST-001 [bg=#00DDEBF7] | Aarav Sharma [bg=#00DDEBF7] | aarav.sharma82@example.com [bg=#00DDEBF7] | PROD-107 [bg=#00DDEBF7] | Yoga Mat [bg=#00DDEBF7] | Sports [bg=#00DDEBF7] | Fitness [bg=#00DDEBF7] | BrandF [bg=#00DDEBF7] | 999 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.11 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-29 06:00 [bg=#00DDEBF7] | 2023-10-31 [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | Net Banking [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 179 Main St, Kolkata [bg=#00DDEBF7] | Kolkata [bg=#00DDEBF7] | West Bengal [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-KOL-01 [bg=#00DDEBF7] | False [bg=#00DDEBF7] | 191 [bg=#00DDEBF7]
+ORD-1012 | CUST-001 | Aarav Sharma | aarav.sharma82@example.com | PROD-103 | Smartphone Model X | Electronics | Mobiles | BrandC | 14999 | 3 | 0.18 | 2023-10-08 14:00 | 2023-10-11 | Pending | UPI | Paid | 621 Main St, Kolkata | Kolkata | West Bengal | India | WH-KOL-01 | False | 82
+ORD-1013 [bg=#00DDEBF7] | CUST-005 [bg=#00DDEBF7] | Arjun Patel [bg=#00DDEBF7] | arjun.patel8@example.com [bg=#00DDEBF7] | PROD-109 [bg=#00DDEBF7] | LEGO Classic Set [bg=#00DDEBF7] | Toys [bg=#00DDEBF7] | Building Blocks [bg=#00DDEBF7] | LEGO [bg=#00DDEBF7] | 2999 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.1 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-07 16:00 [bg=#00DDEBF7] | 2023-11-12 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | Debit Card [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | 69 Main St, Chennai [bg=#00DDEBF7] | Chennai [bg=#00DDEBF7] | Tamil Nadu [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-CHN-03 [bg=#00DDEBF7] | False [bg=#00DDEBF7] | 92 [bg=#00DDEBF7]
+ORD-1014 | CUST-011 | Diya Mehta | diya.mehta74@example.com | PROD-102 | Women's Jeans | Clothing | Women's Wear | BrandB | 1999 | 1 | 0.14 | 2023-10-29 08:00 | 2023-10-31 | Pending | Credit Card | Refunded | 551 Main St, Bengaluru | Bengaluru | Karnataka | India | WH-BLR-01 | False | 122
+ORD-1015 [bg=#00DDEBF7] | CUST-006 [bg=#00DDEBF7] | Sai Joshi [bg=#00DDEBF7] | sai.joshi67@example.com [bg=#00DDEBF7] | PROD-102 [bg=#00DDEBF7] | Women's Jeans [bg=#00DDEBF7] | Clothing [bg=#00DDEBF7] | Women's Wear [bg=#00DDEBF7] | BrandB [bg=#00DDEBF7] | 1999 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.08 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-13 10:00 [bg=#00DDEBF7] | 2023-11-18 [bg=#00DDEBF7] | Shipped [bg=#00DDEBF7] | Wallet [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 289 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 6 [bg=#00DDEBF7]
+ORD-1016 | CUST-008 | Ayaan Khan | ayaan.khan10@example.com | PROD-107 | Yoga Mat | Sports | Fitness | BrandF | 999 | 1 | 0.17 | 2023-11-19 18:00 | 2023-11-21 | Processing | UPI | Paid | 334 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | True | 11
+ORD-1017 [bg=#00DDEBF7] | CUST-015 [bg=#00DDEBF7] | Aarohi Nair [bg=#00DDEBF7] | aarohi.nair14@example.com [bg=#00DDEBF7] | PROD-104 [bg=#00DDEBF7] | Bluetooth Headphones [bg=#00DDEBF7] | Electronics [bg=#00DDEBF7] | Accessories [bg=#00DDEBF7] | BrandD [bg=#00DDEBF7] | 2499 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.16 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-11 18:00 [bg=#00DDEBF7] | 2023-11-14 [bg=#00DDEBF7] | Processing [bg=#00DDEBF7] | Net Banking [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | 292 Main St, Kolkata [bg=#00DDEBF7] | Kolkata [bg=#00DDEBF7] | West Bengal [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-KOL-01 [bg=#00DDEBF7] | False [bg=#00DDEBF7] | 126 [bg=#00DDEBF7]
+ORD-1018 | CUST-007 | Reyansh Reddy | reyansh.reddy78@example.com | PROD-103 | Smartphone Model X | Electronics | Mobiles | BrandC | 14999 | 2 | 0.07 | 2023-10-30 15:00 | 2023-11-02 | Shipped | UPI | Pending | 947 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | False | 99
+ORD-1019 [bg=#00DDEBF7] | CUST-012 [bg=#00DDEBF7] | Saanvi Shah [bg=#00DDEBF7] | saanvi.shah80@example.com [bg=#00DDEBF7] | PROD-106 [bg=#00DDEBF7] | Non-stick Pan [bg=#00DDEBF7] | Home & Kitchen [bg=#00DDEBF7] | Cookware [bg=#00DDEBF7] | BrandE [bg=#00DDEBF7] | 1200 [bg=#00DDEBF7] | 1 [bg=#00DDEBF7] | 0.16 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-07 16:00 [bg=#00DDEBF7] | 2023-10-11 [bg=#00DDEBF7] | Shipped [bg=#00DDEBF7] | UPI [bg=#00DDEBF7] | Refunded [bg=#00DDEBF7] | 124 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 8 [bg=#00DDEBF7]
+ORD-1020 | CUST-002 | Vivaan Singh | vivaan.singh94@example.com | PROD-101 | Men's Cotton T-Shirt | Clothing | Men's Wear | BrandA | 799 | 3 | 0.11 | 2023-11-15 03:00 | 2023-11-19 | Cancelled | Debit Card | Refunded | 429 Main St, Delhi | Delhi | Delhi | India | WH-DEL-02 | False | 145
+ORD-1021 [bg=#00DDEBF7] | CUST-008 [bg=#00DDEBF7] | Ayaan Khan [bg=#00DDEBF7] | ayaan.khan10@example.com [bg=#00DDEBF7] | PROD-102 [bg=#00DDEBF7] | Women's Jeans [bg=#00DDEBF7] | Clothing [bg=#00DDEBF7] | Women's Wear [bg=#00DDEBF7] | BrandB [bg=#00DDEBF7] | 1999 [bg=#00DDEBF7] | 1 [bg=#00DDEBF7] | 0.24 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-05 00:00 [bg=#00DDEBF7] | 2023-10-09 [bg=#00DDEBF7] | Processing [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | 384 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 9 [bg=#00DDEBF7]
+ORD-1022 | CUST-012 | Saanvi Shah | saanvi.shah80@example.com | PROD-102 | Women's Jeans | Clothing | Women's Wear | BrandB | 1999 | 3 | 0.21 | 2023-11-08 05:00 | 2023-11-14 | Shipped | UPI | Paid | 920 Main St, Delhi | Delhi | Delhi | India | WH-DEL-02 | True | 12
+ORD-1023 [bg=#00DDEBF7] | CUST-005 [bg=#00DDEBF7] | Arjun Patel [bg=#00DDEBF7] | arjun.patel8@example.com [bg=#00DDEBF7] | PROD-106 [bg=#00DDEBF7] | Non-stick Pan [bg=#00DDEBF7] | Home & Kitchen [bg=#00DDEBF7] | Cookware [bg=#00DDEBF7] | BrandE [bg=#00DDEBF7] | 1200 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.14 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-24 20:00 [bg=#00DDEBF7] | 2023-10-28 [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | Wallet [bg=#00DDEBF7] | Paid [bg=#00DDEBF7] | 766 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 9 [bg=#00DDEBF7]
+ORD-1024 | CUST-014 | Myra Pillai | myra.pillai52@example.com | PROD-108 | Moisturizing Cream | Beauty | Skincare | BrandG | 450 | 2 | 0.08 | 2023-10-24 07:00 | 2023-10-30 | Cancelled | Wallet | Paid | 81 Main St, Hyderabad | Hyderabad | Telangana | India | WH-HYD-02 | True | 14
+ORD-1025 [bg=#00DDEBF7] | CUST-001 [bg=#00DDEBF7] | Aarav Sharma [bg=#00DDEBF7] | aarav.sharma82@example.com [bg=#00DDEBF7] | PROD-104 [bg=#00DDEBF7] | Bluetooth Headphones [bg=#00DDEBF7] | Electronics [bg=#00DDEBF7] | Accessories [bg=#00DDEBF7] | BrandD [bg=#00DDEBF7] | 2499 [bg=#00DDEBF7] | 3 [bg=#00DDEBF7] | 0.16 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-11 00:00 [bg=#00DDEBF7] | 2023-11-16 [bg=#00DDEBF7] | Delivered [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Paid [bg=#00DDEBF7] | 91 Main St, Kolkata [bg=#00DDEBF7] | Kolkata [bg=#00DDEBF7] | West Bengal [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-KOL-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 6 [bg=#00DDEBF7]
+ORD-1026 | CUST-003 | Aditya Kumar | aditya.kumar5@example.com | PROD-109 | LEGO Classic Set | Toys | Building Blocks | LEGO | 2999 | 1 | 0.25 | 2023-10-07 00:00 | 2023-10-12 | Shipped | Net Banking | Pending | 880 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | True | 5
+ORD-1027 [bg=#00DDEBF7] | CUST-004 [bg=#00DDEBF7] | Vihaan Gupta [bg=#00DDEBF7] | vihaan.gupta39@example.com [bg=#00DDEBF7] | PROD-102 [bg=#00DDEBF7] | Women's Jeans [bg=#00DDEBF7] | Clothing [bg=#00DDEBF7] | Women's Wear [bg=#00DDEBF7] | BrandB [bg=#00DDEBF7] | 1999 [bg=#00DDEBF7] | 1 [bg=#00DDEBF7] | 0.16 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-15 20:00 [bg=#00DDEBF7] | 2023-11-22 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 367 Main St, Delhi [bg=#00DDEBF7] | Delhi [bg=#00DDEBF7] | Delhi [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-DEL-02 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 5 [bg=#00DDEBF7]
+ORD-1028 | CUST-013 | Aanya Iyer | aanya.iyer21@example.com | PROD-104 | Bluetooth Headphones | Electronics | Accessories | BrandD | 2499 | 1 | 0.19 | 2023-10-10 14:00 | 2023-10-12 | Delivered | Wallet | Failed | 203 Main St, Chennai | Chennai | Tamil Nadu | India | WH-CHN-03 | True | 5
+ORD-1029 [bg=#00DDEBF7] | CUST-013 [bg=#00DDEBF7] | Aanya Iyer [bg=#00DDEBF7] | aanya.iyer21@example.com [bg=#00DDEBF7] | PROD-108 [bg=#00DDEBF7] | Moisturizing Cream [bg=#00DDEBF7] | Beauty [bg=#00DDEBF7] | Skincare [bg=#00DDEBF7] | BrandG [bg=#00DDEBF7] | 450 [bg=#00DDEBF7] | 1 [bg=#00DDEBF7] | 0.16 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-19 01:00 [bg=#00DDEBF7] | 2023-11-23 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Paid [bg=#00DDEBF7] | 464 Main St, Bengaluru [bg=#00DDEBF7] | Bengaluru [bg=#00DDEBF7] | Karnataka [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-BLR-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 15 [bg=#00DDEBF7]
+ORD-1030 | CUST-002 | Vivaan Singh | vivaan.singh94@example.com | PROD-103 | Smartphone Model X | Electronics | Mobiles | BrandC | 14999 | 2 | 0.06 | 2023-10-10 04:00 | 2023-10-16 | Shipped | Credit Card | Pending | 685 Main St, Hyderabad | Hyderabad | Telangana | India | WH-HYD-02 | True | 15
+ORD-1031 [bg=#00DDEBF7] | CUST-011 [bg=#00DDEBF7] | Diya Mehta [bg=#00DDEBF7] | diya.mehta74@example.com [bg=#00DDEBF7] | PROD-107 [bg=#00DDEBF7] | Yoga Mat [bg=#00DDEBF7] | Sports [bg=#00DDEBF7] | Fitness [bg=#00DDEBF7] | BrandF [bg=#00DDEBF7] | 999 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.21 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-15 10:00 [bg=#00DDEBF7] | 2023-10-18 [bg=#00DDEBF7] | Processing [bg=#00DDEBF7] | Credit Card [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 388 Main St, Kolkata [bg=#00DDEBF7] | Kolkata [bg=#00DDEBF7] | West Bengal [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-KOL-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 6 [bg=#00DDEBF7]
+ORD-1032 | CUST-011 | Diya Mehta | diya.mehta74@example.com | PROD-105 | The Alchemist | Books | Fiction | PublisherX | 350 | 3 | 0.07 | 2023-10-09 19:00 | 2023-10-14 | Cancelled | Debit Card | Pending | 109 Main St, Hyderabad | Hyderabad | Telangana | India | WH-HYD-02 | False | 132
+ORD-1033 [bg=#00DDEBF7] | CUST-013 [bg=#00DDEBF7] | Aanya Iyer [bg=#00DDEBF7] | aanya.iyer21@example.com [bg=#00DDEBF7] | PROD-105 [bg=#00DDEBF7] | The Alchemist [bg=#00DDEBF7] | Books [bg=#00DDEBF7] | Fiction [bg=#00DDEBF7] | PublisherX [bg=#00DDEBF7] | 350 [bg=#00DDEBF7] | 2 [bg=#00DDEBF7] | 0.09 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-10-14 22:00 [bg=#00DDEBF7] | 2023-10-17 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | UPI [bg=#00DDEBF7] | Failed [bg=#00DDEBF7] | 88 Main St, Hyderabad [bg=#00DDEBF7] | Hyderabad [bg=#00DDEBF7] | Telangana [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-HYD-02 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 9 [bg=#00DDEBF7]
+ORD-1034 | CUST-006 | Sai Joshi | sai.joshi67@example.com | PROD-102 | Women's Jeans | Clothing | Women's Wear | BrandB | 1999 | 3 | 0.1 | 2023-10-20 12:00 | 2023-10-24 | Processing | UPI | Refunded | 540 Main St, Hyderabad | Hyderabad | Telangana | India | WH-HYD-02 | True | 6
+ORD-1035 [bg=#00DDEBF7] | CUST-004 [bg=#00DDEBF7] | Vihaan Gupta [bg=#00DDEBF7] | vihaan.gupta39@example.com [bg=#00DDEBF7] | PROD-104 [bg=#00DDEBF7] | Bluetooth Headphones [bg=#00DDEBF7] | Electronics [bg=#00DDEBF7] | Accessories [bg=#00DDEBF7] | BrandD [bg=#00DDEBF7] | 2499 [bg=#00DDEBF7] | 1 [bg=#00DDEBF7] | 0.19 [bg=#00DDEBF7] |  [bg=#00DDEBF7] | 2023-11-15 06:00 [bg=#00DDEBF7] | 2023-11-19 [bg=#00DDEBF7] | Cancelled [bg=#00DDEBF7] | Net Banking [bg=#00DDEBF7] | Pending [bg=#00DDEBF7] | 450 Main St, Mumbai [bg=#00DDEBF7] | Mumbai [bg=#00DDEBF7] | Maharashtra [bg=#00DDEBF7] | India [bg=#00DDEBF7] | WH-MUM-01 [bg=#00DDEBF7] | True [bg=#00DDEBF7] | 15 [bg=#00DDEBF7]
+
+--- Sheet: Redis_Cache_Stats (rows=7, cols=2) ---
+[Column widths] A=35.0, B=20.0
+Total Orders [bold]
+Cache Hits [bold]
+Cache Misses [bold]
+Hit Ratio % [bold]
+Avg Response Time (Cache Hit) [bold]
+Avg Response Time (Cache Miss) [bold]
+Total Time Saved (ms) [bold]
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: requirements.txt
+──────────────────────────────────────────────────────────────────────
+uvicorn
+fastapi
+sqlmodel
+pydantic
+redis
+openpyxl
+pandas
+pymysql
+python-multipart
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: schemas.py
+──────────────────────────────────────────────────────────────────────
+from pydantic import BaseModel, ConfigDict
+from typing import Optional
+
+
+class OrderBase(BaseModel):
+    order_id: str
+    customer_id: str
+    customer_name: str
+    customer_email: str
+    product_id: str
+    product_name: str
+    category: Optional[str] = None
+    sub_category: Optional[str] = None
+    brand: Optional[str] = None
+    unit_price: Optional[float] = None
+    quantity: Optional[int] = None
+    discount_percent: Optional[float] = None
+    total_price: Optional[float] = None
+    order_date: Optional[str] = None
+    delivery_date: Optional[str] = None
+    order_status: Optional[str] = None
+    payment_method: Optional[str] = None
+    payment_status: Optional[str] = None
+    shipping_address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    warehouse_id: Optional[str] = None
+
+
+class OrderCreate(OrderBase):
+    """Body for POST /orders/create"""
+    pass
+
+
+class OrderFetchRequest(BaseModel):
+    """Body for POST /orders/fetch. Omit order_id to fetch all orders."""
+    order_id: Optional[str] = None
+
+
+class OrderResponse(OrderBase):
+    """Returned to the client — includes cache metadata."""
+    model_config = ConfigDict(from_attributes=True)
+    cache_hit: bool = False
+    response_time_ms: float = 0.0
+
+──────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────
+📄 FILE: seed_data.py
+──────────────────────────────────────────────────────────────────────
+import os
+from openpyxl import load_workbook
+
+from database import SessionLocal, engine, Base
+import models
+
+EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redis_learning_data.xlsx")
+SHEET_NAME = "Order_Data"
+
+COLUMNS = [
+    "order_id", "customer_id", "customer_name", "customer_email",
+    "product_id", "product_name", "category", "sub_category", "brand",
+    "unit_price", "quantity", "discount_percent", "total_price",
+    "order_date", "delivery_date", "order_status", "payment_method",
+    "payment_status", "shipping_address", "city", "state", "country",
+    "warehouse_id",
+]
+
+OPTIONAL_EXTRA_COLUMNS = {"cache_hit", "response_time_ms"}
+
+
+def _to_float(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value):
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_to_order_kwargs(row_values):
+    data = dict(zip(COLUMNS, row_values))
+    data["unit_price"] = _to_float(data.get("unit_price"))
+    data["quantity"] = _to_int(data.get("quantity"))
+    data["discount_percent"] = _to_float(data.get("discount_percent"))
+    data["total_price"] = _to_float(data.get("total_price"))
+
+    if data["total_price"] is None and data["unit_price"] is not None and data["quantity"] is not None:
+        discount = data["discount_percent"] or 0
+        data["total_price"] = round(data["unit_price"] * data["quantity"] * (1 - discount), 2)
+
+    for key in ("order_date", "delivery_date"):
+        if data.get(key) is not None:
+            data[key] = str(data[key])
+
+    return data
+
+
+def validate_excel_headers(excel_source, sheet_name: str = SHEET_NAME):
+    try:
+        wb = load_workbook(excel_source, data_only=True, read_only=True)
+    except Exception as e:
+        return False, f"File is not a valid Excel workbook: {e}"
+
+    if sheet_name not in wb.sheetnames:
+        available = ", ".join(wb.sheetnames)
+        wb.close()
+        return False, f"Sheet '{sheet_name}' not found. Available sheets: {available}"
+
+    ws = wb[sheet_name]
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    wb.close()
+
+    if not header_row:
+        return False, "Header row is empty or missing."
+
+    actual_headers = [str(h).strip() if h is not None else "" for h in header_row]
+    missing = [col for col in COLUMNS if col not in actual_headers]
+    if missing:
+        return False, f"Missing required column(s): {', '.join(missing)}"
+
+    unexpected = [h for h in actual_headers if h and h not in COLUMNS and h not in OPTIONAL_EXTRA_COLUMNS]
+    if unexpected:
+        return False, f"Unrecognized column(s) found: {', '.join(unexpected)}"
+
+    return True, "Column headers are valid."
+
+
+def seed_from_excel(db, excel_path=EXCEL_PATH, sheet_name: str = SHEET_NAME) -> dict:
+    wb = load_workbook(excel_path, data_only=True, read_only=True)
+    ws = wb[sheet_name]
+
+    existing_ids = {oid for (oid,) in db.query(models.Order.order_id).all()}
+
+    inserted, skipped, total_rows = 0, 0, 0
+    rows = ws.iter_rows(min_row=2, values_only=True)
+
+    for row in rows:
+        if row is None or all(v is None for v in row):
+            continue
+        total_rows += 1
+
+        kwargs = _row_to_order_kwargs(row[: len(COLUMNS)])
+        order_id = kwargs.get("order_id")
+        if not order_id:
+            continue
+        if order_id in existing_ids:
+            skipped += 1
+            continue
+
+        db.add(models.Order(**kwargs))
+        existing_ids.add(order_id)
+        inserted += 1
+
+    db.commit()
+    wb.close()
+    return {"inserted": inserted, "skipped_existing": skipped, "total_rows": total_rows}
+
+
+if __name__ == "__main__":
+    Base.metadata.create_all(engine)
+    session = SessionLocal()
+    try:
+        summary = seed_from_excel(session)
+        print(f"✅ Seed complete: {summary}")
+    finally:
+        session.close()
+
+──────────────────────────────────────────────────────────────────────
